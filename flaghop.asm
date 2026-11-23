@@ -2,7 +2,7 @@
 ; Assemble with NASM or Yasm:
 ;   nasm -f bin flaghop.asm -o flaghop.com
 ; Hold Left/Right to run and Space to jump. Reach the flag to win.
-; Enter replays a cleared level. Esc returns to DOS.
+; Enter generates a new course after clearing one. Esc returns to DOS.
 
 bits 16
 org 0x100
@@ -16,58 +16,67 @@ tall     equ 6
 keys     equ 0x300                 ; Zeroed scratch RAM beyond the file image.
 
     cld
-    push ds
-    pop es
     xor ax, ax
     mov di, keys
     mov cx, 64
     rep stosw
 
-    ; Keep the original keyboard vector on the stack across restarts.
+    ; Keep the original keyboard vector and the course seed on the stack.
     mov fs, ax
+    mov bx, 9*4
     cli
-    push dword [fs:9*4]
-    mov word [fs:9*4], keyboard
-    mov [fs:9*4+2], cs
+    push dword [fs:bx]
+    mov word [fs:bx], keyboard
+    mov [fs:bx+2], cs
     sti
+    push word [fs:0x46c]            ; Seed the first course from the BIOS timer.
 
 restart:
     mov ax, 0x13
     int 0x10
     push word 0xa000
     pop es
-    xor di, di
-    mov cx, pitch*200
-    mov al, sky
-    rep stosb
-
-    mov si, terrain
-.strip:
-    lodsw
-    xchg ax, di
-    lodsw                           ; Low byte is width, high byte is height.
-    movzx cx, al
-    mov al, 6
+    mov di, 1                       ; Leave the BIOS-cleared black edges solid.
+    mov cx, pitch-2
+    mov ax, (200 << 8) | sky
     call rectangle
-    mov ax, 0x0202
-    call rectangle                  ; Grass shares the same origin as the dirt.
-    cmp si, terrain_end
-    jb .strip
 
-    mov cx, wide
-.coin:
-    lodsw
-    xchg ax, di
+    mov di, 176*pitch
+    pop bx
+    push bx                         ; Generate from a copy, so respawns repeat.
+    mov dl, 3
+.bay:
+    ror bx, 5                       ; Expose five unused seed bits in BH for this bay.
+    mov cl, bh
+    and cx, 15
+    or cl, 48                       ; Width 48..63 leaves a 17..32 pixel pit.
+    call ground
+
+    push di
+    sub di, 16*pitch-36
+    test bh, 16
+    jz .platform
+    sub di, 12*pitch
+.platform:
+    mov cl, 20
+    mov ax, 0x0806
+    call grass
+    sub di, tall*pitch-8            ; Four-aligned so pickup can find its left edge.
+    mov cl, wide
     mov ax, (tall << 8) | coin
     call rectangle
-    cmp si, coins_end
-    jb .coin
+    pop di
+    add di, 80
+    dec dl
+    jnz .bay
+    mov cl, 80
+    call ground
 
     mov di, 303+138*pitch
-    mov cx, 2
+    mov cl, 2
     mov ax, (38 << 8) | flag
     call rectangle
-    mov cx, 12
+    mov cl, 12
     mov ah, 7
     call rectangle
 
@@ -75,37 +84,35 @@ restart:
     call message
     mov si, 16+(176-tall)*pitch
     xor bp, bp
-    jmp draw
 
+draw:
+    mov ax, (tall << 8) | 12
+    call player
+    mov ax, 0x0204
+    call player
 frame:
-    mov ax, 0x8600                   ; AT BIOS wait in microseconds.
+    mov ah, 0x86                    ; AT BIOS wait in microseconds.
     xor cx, cx
     mov dx, 28000
     int 0x15
 
     mov ax, (tall << 8) | sky
     call player
-    cmp byte [keys+1], 0
+    or al, [keys+1]
     js exit
-    cmp byte [keys+0x39], 0
+    or al, [keys+0x39]
     jns .horizontal
-    mov di, si
-    test byte [es:di+tall*pitch], 1
-    jz .jump
-    test byte [es:di+tall*pitch+wide-1], 1
+    lea di, [si+tall*pitch]
+    mov al, [es:di]
+    and al, [es:di+wide-1]
+    test al, 1
     jnz .horizontal
-.jump:
     mov bp, -10
 .horizontal:
-    xor bx, bx
-    cmp byte [keys+0x4b], 0
-    jns .right
-    dec bx
-.right:
-    cmp byte [keys+0x4d], 0
-    jns .run
-    inc bx
-.run:
+    mov al, [keys+0x4b]
+    sub al, [keys+0x4d]              ; Down is -1, up is 0. Both keys cancel out.
+    cbw
+    xchg ax, bx
     call move
     call move
 
@@ -125,57 +132,63 @@ frame:
     jmp draw
 .land:
     xor bp, bp
+    jmp draw
 
-draw:
-    mov ax, (tall << 8) | 12
-    call player
-    mov ax, 0x0204
-    call player
-    jmp frame
+exit:
+    mov ax, 3
+    int 0x10
+    cli
+    pop ax                          ; Discard the seed before restoring IRQ 1.
+    pop dword [fs:9*4]
+    sti
+    ret
 
 ; SI is a framebuffer address. Adding +/-1 or +/-320 gives a trial move.
 ; Test all four corners and commit SI only if the new position is clear.
 move:
     lea di, [bx+si]
+    call .edge
+    jz .blocked
+    add di, (tall-1)*pitch-(wide-1)
+    call .edge
+    jz .blocked
+    lea si, [bx+si]
+.blocked:
+    ret
+.edge:
     call probe
     jz .blocked
     add di, wide-1
     call probe
-    jz .blocked
-    add di, (tall-1)*pitch
-    call probe
-    jz .blocked
-    sub di, wide-1
-    call probe
-    jz .blocked
-    lea si, [bx+si]
-.blocked:
     ret
 
 probe:
     mov al, [es:di]
     cmp al, flag
+    jb .solid
     je win
-    cmp al, coin
-    jne .solid
-    ; Find the pickup's top-left pixel in VRAM. The strip table is draw-only.
-    push di
+    ; Coins use the highest palette index in the playfield, just above flag.
+    pusha
     and di, -wide
 .top:
     sub di, pitch
     cmp [es:di], al
     je .top
     add di, pitch
-    push cx
+    mov si, di
     mov ax, (tall << 8) | sky
-    mov cx, wide
-    call rectangle
-    pop cx
-    pop di
+    call player
+    popa
 .solid:
     test al, 1                      ; Even palette indices are solid.
     ret
 
+ground:
+    mov ax, 0x1806
+grass:
+    call rectangle
+    mov ax, 0x0202
+    jmp short rectangle
 player:
     mov cx, wide
     mov di, si
@@ -193,15 +206,20 @@ rectangle:                         ; AX = height:color, CX = width, ES:DI = orig
     ret
 
 win:
-    pop ax                          ; Drop the return addresses of probe and move.
+    pop ax                          ; Unwind probe, .edge and move.
+    pop ax
     pop ax
     mov si, victory
     call message
 .wait:
-    cmp byte [keys+1], 0
+    hlt
+    or al, [keys+1]                 ; Message returned AL=0, as do released keys.
     js exit
-    cmp byte [keys+0x1c], 0
+    or al, [keys+0x1c]
     jns .wait
+    pop ax
+    inc ax                          ; Bit 0 flips, changing the first pit width.
+    push ax
     jmp restart
 
 message:
@@ -216,46 +234,21 @@ message:
 .done:
     ret
 
-exit:
-    mov ax, 3
-    int 0x10
-    cli
-    pop dword [fs:9*4]
-    sti
-    ret
-
 keyboard:
     pusha
     in al, 0x60
-    movzx bx, al
-    and bl, 0x7f
-    xor al, 0x80                    ; The sign bit now means the key is down.
-    mov [cs:bx+keys], al
+    cbw
+    mov bl, al
+    and bx, 0x7f
+    not ah                          ; A make code becomes -1, a break code 0.
+    mov [cs:bx+keys], ah
     mov al, 0x20
     out 0x20, al
     popa
     iret
 
-%macro strip 4
-    dw %1 + %2*pitch
-    db %3, %4
-%endmacro
-
-terrain:
-    strip   0,   0,  1, 200        ; Solid borders prevent scanline wraparound.
-    strip 319,   0,  1, 200
-    strip   1, 176, 62,  24
-    strip  92, 176, 51,  24
-    strip 121, 156, 32,   8
-    strip 188, 176, 38,  24
-    strip 199, 153, 33,   8
-    strip 248, 138, 36,   8
-    strip 272, 176, 47,  24
-terrain_end:
-    dw 100+168*pitch, 168+111*pitch, 268+125*pitch
-coins_end:
 title   db 'FLAG HOP', 13, 10, 0
-victory db 'CLEAR! ENTER=REPLAY', 0
+victory db 'CLEAR! ENTER', 0
 
 ; A negative TIMES count is an assembly error at 512 bytes and above.
 times -(($-$$)/512) db 0
